@@ -1,0 +1,128 @@
+// EdgeTunnel Personal - Stage 1: VLESS over WebSocket (minimal)
+// Variables (Settings > Variables): UUID, WS_PATH (e.g. /ws-xxxx), SUB_PATH (e.g. /sub-xxxx)
+import { connect } from 'cloudflare:sockets';
+
+const DECOY = `<!doctype html><html><head><meta charset="utf-8"><title>Click Game</title></head>
+<body style="font-family:sans-serif;text-align:center;margin-top:20vh">
+<h1>Click Game</h1><button id="b" style="font-size:2rem;padding:1rem 2rem">0</button>
+<script>let n=0;b.onclick=()=>b.textContent=++n</script></body></html>`;
+
+export default {
+  async fetch(request, env) {
+    const UUID = (env.UUID || '').toLowerCase();
+    const WS_PATH = env.WS_PATH || '/ws';
+    const SUB_PATH = env.SUB_PATH || '/sub';
+    const url = new URL(request.url);
+
+    if (request.headers.get('Upgrade') === 'websocket' && url.pathname === WS_PATH) {
+      return handleWS(UUID);
+    }
+    if (url.pathname === '/health') return new Response('ok');
+    if (url.pathname === SUB_PATH) {
+      const host = url.hostname;
+      const link =
+        `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}` +
+        `&fp=chrome&type=ws&host=${host}&path=${encodeURIComponent(WS_PATH)}#EdgeTunnel-WS`;
+      return new Response(btoa(link), { headers: { 'content-type': 'text/plain' } });
+    }
+    return new Response(DECOY, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+  },
+};
+
+function handleWS(UUID) {
+  const [client, server] = Object.values(new WebSocketPair());
+  server.accept();
+  server.binaryType = 'arraybuffer'; // required, otherwise ping = -1
+
+  let writer = null;
+  let remote = null;
+  let closed = false;
+
+  const closeAll = () => {
+    if (closed) return;
+    closed = true;
+    try { writer && writer.releaseLock(); } catch {}
+    try { remote && remote.close(); } catch {}
+    try { server.close(); } catch {}
+  };
+
+  // process messages strictly in order
+  let chain = Promise.resolve();
+  server.addEventListener('message', (ev) => {
+    chain = chain.then(() => onMessage(ev.data)).catch(closeAll);
+  });
+  server.addEventListener('close', closeAll);
+  server.addEventListener('error', closeAll);
+
+  async function onMessage(data) {
+    const buf = new Uint8Array(data);
+    if (writer) {
+      await writer.write(buf);
+      return;
+    }
+    const h = parseVless(buf, UUID);
+    if (!h) throw new Error('bad header');
+
+    remote = connect({ hostname: h.host, port: h.port });
+    writer = remote.writable.getWriter();
+    if (h.payload.byteLength) await writer.write(h.payload);
+
+    const respHeader = new Uint8Array([h.version, 0]);
+    let first = true;
+    remote.readable
+      .pipeTo(
+        new WritableStream({
+          write(chunk) {
+            if (first) {
+              first = false;
+              const out = new Uint8Array(respHeader.length + chunk.byteLength);
+              out.set(respHeader, 0);
+              out.set(chunk, respHeader.length);
+              server.send(out);
+            } else {
+              server.send(chunk);
+            }
+          },
+          close: closeAll,
+          abort: closeAll,
+        })
+      )
+      .catch(closeAll);
+  }
+
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+function parseVless(b, UUID) {
+  if (b.length < 24) return null;
+  const version = b[0];
+  let hex = '';
+  for (let i = 1; i < 17; i++) hex += b[i].toString(16).padStart(2, '0');
+  const id = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  if (id !== UUID) return null;
+
+  let p = 17;
+  p += 1 + b[p];            // skip addons
+  const cmd = b[p++];
+  if (cmd !== 1) return null; // TCP only in stage 1
+  const port = (b[p] << 8) | b[p + 1];
+  p += 2;
+  const atyp = b[p++];
+  let host;
+  if (atyp === 1) {
+    host = `${b[p]}.${b[p + 1]}.${b[p + 2]}.${b[p + 3]}`;
+    p += 4;
+  } else if (atyp === 2) {
+    const len = b[p++];
+    host = new TextDecoder().decode(b.subarray(p, p + len));
+    p += len;
+  } else if (atyp === 3) {
+    const parts = [];
+    for (let i = 0; i < 8; i++) parts.push(((b[p + i * 2] << 8) | b[p + i * 2 + 1]).toString(16));
+    host = parts.join(':');
+    p += 16;
+  } else {
+    return null;
+  }
+  return { version, host, port, payload: b.subarray(p) };
+}
