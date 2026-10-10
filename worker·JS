@@ -1,5 +1,5 @@
-// EdgeTunnel Personal - Stage 1: VLESS over WebSocket (minimal)
-// Variables (Settings > Variables): UUID, WS_PATH (e.g. /ws-xxxx), SUB_PATH (e.g. /sub-xxxx)
+// EdgeTunnel Personal - Stage 2: VLESS over WebSocket + XHTTP (stream-one)
+// Variables: UUID, WS_PATH (e.g. /ws-k29xq), XHTTP_PATH (e.g. /xh-p83dn), SUB_PATH (e.g. /sub-m71zt)
 import { connect } from 'cloudflare:sockets';
 
 const DECOY = `<!doctype html><html><head><meta charset="utf-8"><title>Click Game</title></head>
@@ -11,24 +11,35 @@ export default {
   async fetch(request, env) {
     const UUID = (env.UUID || '').toLowerCase();
     const WS_PATH = env.WS_PATH || '/ws';
+    const XHTTP_PATH = env.XHTTP_PATH || '/xh';
     const SUB_PATH = env.SUB_PATH || '/sub';
     const url = new URL(request.url);
 
     if (request.headers.get('Upgrade') === 'websocket' && url.pathname === WS_PATH) {
       return handleWS(UUID);
     }
+    if (request.method === 'POST' && url.pathname.startsWith(XHTTP_PATH)) {
+      return handleXhttp(request, UUID);
+    }
     if (url.pathname === '/health') return new Response('ok');
     if (url.pathname === SUB_PATH) {
-      const host = url.hostname;
-      const link =
-        `vless://${UUID}@${host}:443?encryption=none&security=tls&sni=${host}` +
-        `&fp=chrome&type=ws&host=${host}&path=${encodeURIComponent(WS_PATH)}#EdgeTunnel-WS`;
-      return new Response(btoa(link), { headers: { 'content-type': 'text/plain' } });
+      const h = url.hostname;
+      const wsP = encodeURIComponent(WS_PATH);
+      const xhP = encodeURIComponent(XHTTP_PATH);
+      const base = `encryption=none&security=tls&sni=${h}&fp=chrome`;
+      const links = [
+        `vless://${UUID}@${h}:443?${base}&type=ws&host=${h}&path=${wsP}#ET-WS-443`,
+        `vless://${UUID}@${h}:443?${base}&alpn=h2&type=xhttp&mode=stream-one&host=${h}&path=${xhP}#ET-XHTTP-443`,
+        `vless://${UUID}@${h}:8443?${base}&alpn=h2&type=xhttp&mode=stream-one&host=${h}&path=${xhP}#ET-XHTTP-8443`,
+        `vless://${UUID}@${h}:2087?${base}&alpn=h2&type=xhttp&mode=stream-one&host=${h}&path=${xhP}#ET-XHTTP-2087`,
+      ];
+      return new Response(btoa(links.join('\n')), { headers: { 'content-type': 'text/plain' } });
     }
     return new Response(DECOY, { headers: { 'content-type': 'text/html; charset=utf-8' } });
   },
 };
 
+/* ---------------- WebSocket ---------------- */
 function handleWS(UUID) {
   const [client, server] = Object.values(new WebSocketPair());
   server.accept();
@@ -46,7 +57,6 @@ function handleWS(UUID) {
     try { server.close(); } catch {}
   };
 
-  // process messages strictly in order
   let chain = Promise.resolve();
   server.addEventListener('message', (ev) => {
     chain = chain.then(() => onMessage(ev.data)).catch(closeAll);
@@ -93,6 +103,54 @@ function handleWS(UUID) {
   return new Response(null, { status: 101, webSocket: client });
 }
 
+/* ---------------- XHTTP (stream-one) ----------------
+   One POST request: request body = client->server stream,
+   response body = server->client stream. Both piped natively. */
+async function handleXhttp(request, UUID) {
+  if (!request.body) return new Response('bad request', { status: 400 });
+
+  const reader = request.body.getReader();
+  const first = await reader.read();
+  if (first.done || !first.value) return new Response('bad request', { status: 400 });
+
+  const h = parseVless(first.value, UUID);
+  if (!h) return new Response('not found', { status: 404 });
+
+  let remote;
+  try {
+    remote = connect({ hostname: h.host, port: h.port });
+  } catch {
+    return new Response('bad gateway', { status: 502 });
+  }
+
+  // client -> remote: write the rest of the first chunk, then pipe natively
+  const w = remote.writable.getWriter();
+  if (h.payload.byteLength) await w.write(h.payload);
+  w.releaseLock();
+  reader.releaseLock();
+  request.body.pipeTo(remote.writable).catch(() => {});
+
+  // remote -> client: VLESS response header first, then native pipe
+  const { readable, writable } = new IdentityTransformStream();
+  (async () => {
+    const rw = writable.getWriter();
+    await rw.write(new Uint8Array([h.version, 0]));
+    rw.releaseLock();
+    await remote.readable.pipeTo(writable);
+  })().catch(() => {
+    try { remote.close(); } catch {}
+  });
+
+  return new Response(readable, {
+    headers: {
+      'content-type': 'application/octet-stream',
+      'cache-control': 'no-store',
+      'x-accel-buffering': 'no',
+    },
+  });
+}
+
+/* ---------------- VLESS header ---------------- */
 function parseVless(b, UUID) {
   if (b.length < 24) return null;
   const version = b[0];
@@ -104,7 +162,7 @@ function parseVless(b, UUID) {
   let p = 17;
   p += 1 + b[p];            // skip addons
   const cmd = b[p++];
-  if (cmd !== 1) return null; // TCP only in stage 1
+  if (cmd !== 1) return null; // TCP only
   const port = (b[p] << 8) | b[p + 1];
   p += 2;
   const atyp = b[p++];
